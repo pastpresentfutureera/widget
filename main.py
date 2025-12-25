@@ -1,7 +1,7 @@
 """
 Desktop Widgets Pro for Windows 11
-Beautiful, colorful, draggable, resizable widgets
-Auto-starts with Windows!
+FIXED: Widgets stay visible during "Show Desktop" gesture (3-finger swipe)
+Widgets are embedded into the desktop layer!
 """
 
 import tkinter as tk
@@ -11,27 +11,53 @@ from datetime import datetime, timedelta
 import json
 import os
 import ctypes
+from ctypes import wintypes
 import sys
 import winreg
-import shutil
 
-# ============== WINDOWS API ==============
-try:
-    user32 = ctypes.windll.user32
-    HWND_BOTTOM = 1
-    SWP_NOSIZE = 0x0001
-    SWP_NOMOVE = 0x0002
-    SWP_NOACTIVATE = 0x0010
-except:
-    pass
+# ============== WINDOWS API SETUP ==============
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+# Constants
+GWL_EXSTYLE = -20
+GWL_STYLE = -16
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOPMOST = 0x00000008
+HWND_BOTTOM = 1
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+GW_HWNDPREV = 3
+GA_ROOT = 2
+
+# For finding desktop window
+EnumWindows = user32.EnumWindows
+EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+GetClassName = user32.GetClassNameW
+FindWindow = user32.FindWindowW
+FindWindowEx = user32.FindWindowExW
+SendMessageTimeout = user32.SendMessageTimeoutW
+SetParent = user32.SetParent
+GetParent = user32.GetParent
+SetWindowLong = user32.SetWindowLongW
+GetWindowLong = user32.GetWindowLongW
+SetWindowPos = user32.SetWindowPos
+ShowWindow = user32.ShowWindow
+GetWindowRect = user32.GetWindowRect
+IsIconic = user32.IsIconic
+GetForegroundWindow = user32.GetForegroundWindow
 
 # ============== PATHS ==============
 if getattr(sys, 'frozen', False):
-    # Running as compiled EXE
     APP_PATH = sys.executable
     APP_DIR = os.path.dirname(sys.executable)
 else:
-    # Running as script
     APP_PATH = os.path.abspath(__file__)
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -96,26 +122,89 @@ THEMES = {
 
 # ============== FONTS ==============
 FONTS = {
-    "title": ("Segoe UI Semibold", 13),
+    "title": ("Segoe UI Semibold", 12),
     "header": ("Segoe UI Semibold", 11),
-    "normal": ("Segoe UI", 11),
-    "small": ("Segoe UI", 10),
-    "tiny": ("Segoe UI", 9),
-    "button": ("Segoe UI Semibold", 10),
-    "icon": ("Segoe UI", 14),
+    "normal": ("Segoe UI", 10),
+    "small": ("Segoe UI", 9),
+    "tiny": ("Segoe UI", 8),
+    "button": ("Segoe UI Semibold", 9),
+    "icon": ("Segoe UI", 12),
     "clock": ("Segoe UI Light", 32),
-    "clock_date": ("Segoe UI", 12),
+    "clock_date": ("Segoe UI", 11),
 }
+
+
+# ============== DESKTOP INTEGRATION ==============
+class DesktopIntegration:
+    """Handles embedding widgets into the Windows desktop layer"""
+    
+    workerw = None
+    
+    @staticmethod
+    def get_workerw():
+        """Find the WorkerW window that hosts the desktop wallpaper"""
+        if DesktopIntegration.workerw:
+            return DesktopIntegration.workerw
+        
+        progman = FindWindow("Progman", None)
+        if not progman:
+            return None
+        
+        # Send message to spawn WorkerW
+        result = ctypes.c_ulong()
+        SendMessageTimeout(progman, 0x052C, 0, 0, 0x0000, 1000, ctypes.byref(result))
+        
+        workerw = None
+        
+        def enum_callback(hwnd, lparam):
+            nonlocal workerw
+            shell = FindWindowEx(hwnd, None, "SHELLDLL_DefView", None)
+            if shell:
+                workerw = FindWindowEx(None, hwnd, "WorkerW", None)
+            return True
+        
+        EnumWindows(EnumWindowsProc(enum_callback), 0)
+        
+        DesktopIntegration.workerw = workerw
+        return workerw
+    
+    @staticmethod
+    def embed_to_desktop(hwnd):
+        """Embed a window into the desktop layer"""
+        try:
+            workerw = DesktopIntegration.get_workerw()
+            if workerw:
+                # Set parent to WorkerW
+                SetParent(hwnd, workerw)
+                return True
+            else:
+                # Fallback: Set parent to Progman
+                progman = FindWindow("Progman", None)
+                if progman:
+                    SetParent(hwnd, progman)
+                    return True
+        except Exception as e:
+            print(f"Desktop embed error: {e}")
+        return False
+    
+    @staticmethod
+    def set_desktop_style(hwnd):
+        """Set window styles for desktop integration"""
+        try:
+            # Remove from taskbar and alt-tab
+            ex_style = GetWindowLong(hwnd, GWL_EXSTYLE)
+            ex_style |= WS_EX_TOOLWINDOW
+            ex_style |= WS_EX_NOACTIVATE
+            SetWindowLong(hwnd, GWL_EXSTYLE, ex_style)
+            return True
+        except:
+            return False
 
 
 # ============== AUTOSTART FUNCTIONS ==============
 def is_autostart_enabled():
-    """Check if autostart is enabled"""
-    # Check startup folder
     if os.path.exists(SHORTCUT_PATH):
         return True
-    
-    # Check registry
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -132,10 +221,7 @@ def is_autostart_enabled():
 
 
 def enable_autostart():
-    """Enable autostart on Windows startup"""
     success = False
-    
-    # Method 1: Create batch file in Startup folder (most reliable)
     try:
         batch_content = f'@echo off\nstart "" "{APP_PATH}"\n'
         with open(SHORTCUT_PATH, 'w') as f:
@@ -144,7 +230,6 @@ def enable_autostart():
     except Exception as e:
         print(f"Startup folder method failed: {e}")
     
-    # Method 2: Registry (backup method)
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -159,15 +244,12 @@ def enable_autostart():
 
 
 def disable_autostart():
-    """Disable autostart"""
-    # Remove from Startup folder
     try:
         if os.path.exists(SHORTCUT_PATH):
             os.remove(SHORTCUT_PATH)
-    except Exception as e:
-        print(f"Failed to remove startup file: {e}")
+    except:
+        pass
     
-    # Remove from registry
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -177,43 +259,90 @@ def disable_autostart():
         except FileNotFoundError:
             pass
         winreg.CloseKey(key)
-    except Exception as e:
-        print(f"Failed to remove registry entry: {e}")
+    except:
+        pass
+
+
+# ============== SCROLLABLE FRAME ==============
+class ScrollableFrame(tk.Frame):
+    """A frame with both horizontal and vertical scrollbars"""
+    
+    def __init__(self, parent, bg="white", scroll_x=True, scroll_y=True):
+        super().__init__(parent, bg=bg)
+        
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
+        
+        if scroll_y:
+            self.v_scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+            self.v_scrollbar.pack(side="right", fill="y")
+            self.canvas.configure(yscrollcommand=self.v_scrollbar.set)
+        
+        if scroll_x:
+            self.h_scrollbar = tk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+            self.h_scrollbar.pack(side="bottom", fill="x")
+            self.canvas.configure(xscrollcommand=self.h_scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        
+        self.inner_frame = tk.Frame(self.canvas, bg=bg)
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
+        
+        self.inner_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        
+        # Mouse wheel
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
+        self.inner_frame.bind("<MouseWheel>", self._on_mousewheel)
+    
+    def _on_frame_configure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    
+    def _on_canvas_configure(self, event):
+        pass
+    
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    def _on_shift_mousewheel(self, event):
+        self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    def update_bg(self, bg):
+        self.config(bg=bg)
+        self.canvas.config(bg=bg)
+        self.inner_frame.config(bg=bg)
 
 
 # ============== BASE WIDGET CLASS ==============
 class BaseWidget:
-    """Base class for all widgets"""
+    """Base class for all widgets - embedded in desktop layer"""
     
-    def __init__(self, master, title, widget_id, app, default_size=(320, 420)):
+    def __init__(self, master, title, widget_id, app, default_size=(320, 420), min_size=(200, 150)):
         self.app = app
         self.widget_id = widget_id
         self.master = master
         self.title_text = title
+        self.min_width, self.min_height = min_size
+        self.is_embedded = False
         
-        # Get widget-specific theme
         widget_theme = app.data.get("widget_themes", {}).get(widget_id, app.data.get("theme", "🌊 Ocean Blue"))
         self.theme = THEMES.get(widget_theme, THEMES["🌊 Ocean Blue"])
         
-        # Create window
         self.window = tk.Toplevel(master)
         self.window.title(title)
         self.window.overrideredirect(True)
         
-        # Get saved position and size
         pos = app.data.get("widget_positions", {}).get(widget_id, {"x": 100, "y": 100})
         size = app.data.get("widget_sizes", {}).get(widget_id, {"w": default_size[0], "h": default_size[1]})
         
         self.window.geometry(f"{size['w']}x{size['h']}+{pos['x']}+{pos['y']}")
         
-        # Drag and resize
         self.drag_data = {"x": 0, "y": 0, "dragging": False}
         self.resize_data = {"active": False}
         
         self.window.attributes('-topmost', False)
         self.window.attributes('-alpha', 0.97)
         
-        # Shadow frame
         self.outer_frame = tk.Frame(self.window, bg="#888888", padx=1, pady=1)
         self.outer_frame.pack(fill="both", expand=True)
         
@@ -223,15 +352,58 @@ class BaseWidget:
         self.create_header(title)
         
         self.content = tk.Frame(self.container, bg=self.theme["bg"])
-        self.content.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.content.pack(fill="both", expand=True, padx=5, pady=(0, 5))
         
         self.create_resize_grip()
         
-        self.window.after(100, self.send_to_desktop)
+        # Embed to desktop after window is ready
+        self.window.after(200, self.embed_to_desktop)
+        
+        # Keep checking if window needs re-embedding
+        self.window.after(1000, self.check_visibility)
+    
+    def embed_to_desktop(self):
+        """Embed this widget into the desktop layer"""
+        try:
+            self.window.update_idletasks()
+            hwnd = GetParent(self.window.winfo_id())
+            
+            # Set tool window style first
+            DesktopIntegration.set_desktop_style(hwnd)
+            
+            # Embed into desktop
+            if DesktopIntegration.embed_to_desktop(hwnd):
+                self.is_embedded = True
+                # Force show after embedding
+                self.window.deiconify()
+                self.window.lift()
+        except Exception as e:
+            print(f"Embed error for {self.widget_id}: {e}")
+    
+    def check_visibility(self):
+        """Periodically check if widget is visible and restore if needed"""
+        try:
+            if self.widget_id not in self.app.data.get("hidden_widgets", []):
+                hwnd = GetParent(self.window.winfo_id())
+                
+                # Check if minimized
+                if IsIconic(hwnd):
+                    ShowWindow(hwnd, 9)  # SW_RESTORE
+                    self.window.deiconify()
+                
+                # Make sure it's visible
+                if not self.window.winfo_viewable():
+                    self.window.deiconify()
+                    if not self.is_embedded:
+                        self.embed_to_desktop()
+        except:
+            pass
+        
+        # Check again
+        self.window.after(500, self.check_visibility)
     
     def create_header(self, title):
-        """Create header"""
-        self.header = tk.Frame(self.container, bg=self.theme["header"], height=40)
+        self.header = tk.Frame(self.container, bg=self.theme["header"], height=36)
         self.header.pack(fill="x")
         self.header.pack_propagate(False)
         
@@ -239,30 +411,30 @@ class BaseWidget:
             self.header, text=f"  {title}", bg=self.theme["header"],
             fg=self.theme["text"], font=FONTS["title"], anchor="w"
         )
-        self.title_label.pack(side="left", fill="x", expand=True, padx=5)
+        self.title_label.pack(side="left", fill="x", expand=True, padx=3)
         
         controls = tk.Frame(self.header, bg=self.theme["header"])
-        controls.pack(side="right", padx=5)
+        controls.pack(side="right", padx=3)
         
         self.color_btn = tk.Label(
             controls, text="🎨", bg=self.theme["header"],
             fg=self.theme["text"], font=FONTS["icon"], cursor="hand2"
         )
-        self.color_btn.pack(side="left", padx=3)
+        self.color_btn.pack(side="left", padx=2)
         self.color_btn.bind("<Button-1>", self.show_color_menu)
         
         self.min_btn = tk.Label(
             controls, text="─", bg=self.theme["header"],
-            fg=self.theme["text"], font=("Segoe UI", 14, "bold"), cursor="hand2"
+            fg=self.theme["text"], font=("Segoe UI", 12, "bold"), cursor="hand2"
         )
-        self.min_btn.pack(side="left", padx=3)
+        self.min_btn.pack(side="left", padx=2)
         self.min_btn.bind("<Button-1>", self.minimize)
         
         self.close_btn = tk.Label(
             controls, text="✕", bg=self.theme["header"],
             fg=self.theme["text"], font=FONTS["icon"], cursor="hand2"
         )
-        self.close_btn.pack(side="left", padx=3)
+        self.close_btn.pack(side="left", padx=2)
         self.close_btn.bind("<Button-1>", self.hide_widget)
         
         for widget in [self.header, self.title_label]:
@@ -271,14 +443,12 @@ class BaseWidget:
             widget.bind("<ButtonRelease-1>", self.stop_drag)
     
     def show_color_menu(self, event=None):
-        """Show color menu"""
         menu = tk.Menu(self.window, tearoff=0, font=FONTS["normal"])
         for theme_name in THEMES.keys():
             menu.add_command(label=theme_name, command=lambda t=theme_name: self.change_widget_theme(t))
         menu.post(event.x_root, event.y_root)
     
     def change_widget_theme(self, theme_name):
-        """Change widget theme"""
         self.theme = THEMES[theme_name]
         if "widget_themes" not in self.app.data:
             self.app.data["widget_themes"] = {}
@@ -287,10 +457,9 @@ class BaseWidget:
         self.update_theme()
     
     def create_resize_grip(self):
-        """Create resize grip"""
         self.resize_grip = tk.Label(
-            self.container, text="⋮⋮", bg=self.theme["bg"],
-            fg=self.theme["accent"], font=("Segoe UI", 12), cursor="size_nw_se"
+            self.container, text="⋱", bg=self.theme["bg"],
+            fg=self.theme["accent"], font=("Segoe UI", 10), cursor="size_nw_se"
         )
         self.resize_grip.place(relx=1.0, rely=1.0, anchor="se")
         self.resize_grip.bind("<Button-1>", self.start_resize)
@@ -323,9 +492,9 @@ class BaseWidget:
         if self.resize_data["active"]:
             dx = event.x_root - self.resize_data["x"]
             dy = event.y_root - self.resize_data["y"]
-            new_w = max(250, self.resize_data["width"] + dx)
-            new_h = max(200, self.resize_data["height"] + dy)
-            self.window.geometry(f"{new_w}x{new_h}")
+            new_w = max(self.min_width, self.resize_data["width"] + dx)
+            new_h = max(self.min_height, self.resize_data["height"] + dy)
+            self.window.geometry(f"{int(new_w)}x{int(new_h)}")
     
     def stop_resize(self, event):
         self.resize_data["active"] = False
@@ -351,14 +520,6 @@ class BaseWidget:
         }
         self.app.save_data()
     
-    def send_to_desktop(self):
-        try:
-            hwnd = ctypes.windll.user32.GetParent(self.window.winfo_id())
-            ctypes.windll.user32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-        except:
-            pass
-    
     def minimize(self, event=None):
         self.window.withdraw()
         self.window.after(100, self.window.deiconify)
@@ -377,6 +538,8 @@ class BaseWidget:
         if "hidden_widgets" in self.app.data and self.widget_id in self.app.data["hidden_widgets"]:
             self.app.data["hidden_widgets"].remove(self.widget_id)
         self.app.save_data()
+        # Re-embed when showing
+        self.window.after(100, self.embed_to_desktop)
     
     def update_theme(self):
         t = self.theme
@@ -393,22 +556,21 @@ class BaseWidget:
 
 # ============== CALENDAR WIDGET ==============
 class CalendarWidget(BaseWidget):
-    """Calendar with events below each date"""
+    """Calendar with scrollable grid"""
     
     def __init__(self, master, app):
-        super().__init__(master, "📅 Calendar", "calendar", app, (380, 480))
+        super().__init__(master, "📅 Calendar", "calendar", app, (400, 450), (280, 250))
         self.current_date = datetime.now()
         self.create_content()
     
     def create_content(self):
-        # Navigation
         nav = tk.Frame(self.content, bg=self.theme["bg"])
-        nav.pack(fill="x", pady=(5, 10))
+        nav.pack(fill="x", pady=3)
         
         self.prev_btn = tk.Button(
-            nav, text="◀ Prev", command=self.prev_month,
+            nav, text="◀", command=self.prev_month,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=10, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
         )
         self.prev_btn.pack(side="left")
         
@@ -418,64 +580,45 @@ class CalendarWidget(BaseWidget):
         )
         self.month_label.pack(side="left", fill="x", expand=True)
         
-        self.next_btn = tk.Button(
-            nav, text="Next ▶", command=self.next_month,
-            bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=10, cursor="hand2"
-        )
-        self.next_btn.pack(side="right")
-        
         self.today_btn = tk.Button(
             nav, text="Today", command=self.go_today,
             bg=self.theme["accent"], fg="white",
-            font=FONTS["small"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["tiny"], bd=0, padx=6, cursor="hand2"
         )
-        self.today_btn.pack(side="right", padx=5)
+        self.today_btn.pack(side="right", padx=3)
         
-        # Days header
-        days_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        days_frame.pack(fill="x")
+        self.next_btn = tk.Button(
+            nav, text="▶", command=self.next_month,
+            bg=self.theme["button"], fg=self.theme["text"],
+            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
+        )
+        self.next_btn.pack(side="right")
         
-        self.day_labels = []
-        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        for i, day in enumerate(days):
-            color = "#E74C3C" if i >= 5 else self.theme["text"]
-            lbl = tk.Label(
-                days_frame, text=day, bg=self.theme["header"],
-                fg=color, font=FONTS["small"], width=5
-            )
-            lbl.pack(side="left", expand=True, fill="x", padx=1)
-            self.day_labels.append(lbl)
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=True, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
         
-        # Calendar grid
-        cal_container = tk.Frame(self.content, bg=self.theme["bg"])
-        cal_container.pack(fill="both", expand=True, pady=5)
+        self.cal_frame = self.scroll_frame.inner_frame
         
-        self.cal_canvas = tk.Canvas(cal_container, bg=self.theme["bg"], highlightthickness=0)
-        self.cal_scrollbar = tk.Scrollbar(cal_container, orient="vertical", command=self.cal_canvas.yview)
-        
-        self.cal_canvas.pack(side="left", fill="both", expand=True)
-        self.cal_scrollbar.pack(side="right", fill="y")
-        
-        self.cal_canvas.configure(yscrollcommand=self.cal_scrollbar.set)
-        
-        self.cal_frame = tk.Frame(self.cal_canvas, bg=self.theme["bg"])
-        self.cal_canvas.create_window((0, 0), window=self.cal_frame, anchor="nw")
-        
-        self.date_cells = []
         self.update_calendar()
-        
-        self.cal_frame.bind("<Configure>", lambda e: self.cal_canvas.configure(scrollregion=self.cal_canvas.bbox("all")))
     
     def update_calendar(self):
         for widget in self.cal_frame.winfo_children():
             widget.destroy()
-        self.date_cells = []
         
         year = self.current_date.year
         month = self.current_date.month
         
         self.month_label.config(text=f"{calendar.month_name[month]} {year}")
+        
+        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for col, day in enumerate(days):
+            fg_color = "#E74C3C" if col >= 5 else self.theme["text"]
+            lbl = tk.Label(
+                self.cal_frame, text=day, bg=self.theme["header"],
+                fg=fg_color, font=FONTS["small"], width=10, height=1,
+                relief="solid", bd=1
+            )
+            lbl.grid(row=0, column=col, sticky="nsew", padx=0, pady=0)
         
         cal = calendar.monthcalendar(year, month)
         today = datetime.now()
@@ -483,8 +626,10 @@ class CalendarWidget(BaseWidget):
         
         for row_idx, week in enumerate(cal):
             for col_idx, day in enumerate(week):
-                cell = tk.Frame(self.cal_frame, bg=self.theme["entry"], bd=1, relief="solid")
-                cell.grid(row=row_idx, column=col_idx, padx=1, pady=1, sticky="nsew")
+                cell = tk.Frame(self.cal_frame, bg=self.theme["entry"], 
+                               relief="solid", bd=1, width=70, height=60)
+                cell.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=0, pady=0)
+                cell.grid_propagate(False)
                 
                 if day != 0:
                     date_key = f"{year}-{month:02d}-{day:02d}"
@@ -497,28 +642,24 @@ class CalendarWidget(BaseWidget):
                     
                     date_lbl = tk.Label(
                         cell, text=str(day), bg=date_bg, fg=date_fg,
-                        font=FONTS["small"], width=4
+                        font=FONTS["small"], anchor="nw"
                     )
                     date_lbl.pack(anchor="nw", padx=2, pady=1)
                     
                     event_text = events.get(date_key, "")
                     event_entry = tk.Text(
-                        cell, height=2, width=6, bg=self.theme["entry"],
+                        cell, height=2, width=8, bg=self.theme["entry"],
                         fg=self.theme["text_light"], font=FONTS["tiny"],
                         bd=0, wrap="word", relief="flat"
                     )
-                    event_entry.pack(fill="both", expand=True, padx=2, pady=1)
+                    event_entry.pack(fill="both", expand=True, padx=1, pady=1)
                     event_entry.insert("1.0", event_text)
                     event_entry.bind("<KeyRelease>", lambda e, dk=date_key, et=event_entry: self.save_event(dk, et))
-                    
-                    self.date_cells.append({"frame": cell, "date_lbl": date_lbl, "event": event_entry, "date_key": date_key})
                 else:
                     cell.config(bg=self.theme["bg"])
         
-        for i in range(7):
-            self.cal_frame.columnconfigure(i, weight=1, minsize=50)
-        for i in range(len(cal)):
-            self.cal_frame.rowconfigure(i, weight=1, minsize=60)
+        self.cal_frame.update_idletasks()
+        self.scroll_frame.canvas.configure(scrollregion=self.scroll_frame.canvas.bbox("all"))
     
     def save_event(self, date_key, text_widget):
         if "calendar_events" not in self.app.data:
@@ -557,41 +698,36 @@ class CalendarWidget(BaseWidget):
         self.next_btn.config(bg=t["button"], fg=t["text"])
         self.today_btn.config(bg=t["accent"])
         self.month_label.config(bg=t["bg"], fg=t["text"])
-        self.cal_canvas.config(bg=t["bg"])
-        self.cal_frame.config(bg=t["bg"])
-        for lbl in self.day_labels:
-            lbl.config(bg=t["header"])
+        self.scroll_frame.update_bg(t["bg"])
         self.update_calendar()
 
 
 # ============== TODO WIDGET ==============
 class TodoWidget(BaseWidget):
-    """To-Do List with priorities"""
+    """To-Do List"""
     
     def __init__(self, master, app):
-        super().__init__(master, "✅ To-Do List", "todo", app, (320, 450))
+        super().__init__(master, "✅ To-Do List", "todo", app, (300, 400), (200, 200))
         self.create_content()
     
     def create_content(self):
         add_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        add_frame.pack(fill="x", pady=5)
+        add_frame.pack(fill="x", pady=3)
         
         self.task_entry = tk.Entry(
             add_frame, bg=self.theme["entry"], fg=self.theme["text"],
             font=FONTS["normal"], bd=1, relief="solid"
         )
-        self.task_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        self.task_entry.insert(0, "Add new task...")
-        self.task_entry.bind("<FocusIn>", lambda e: self.task_entry.delete(0, "end") if self.task_entry.get() == "Add new task..." else None)
+        self.task_entry.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.task_entry.insert(0, "New task...")
+        self.task_entry.bind("<FocusIn>", lambda e: self.task_entry.delete(0, "end") if self.task_entry.get() == "New task..." else None)
         self.task_entry.bind("<Return>", self.add_task)
         
         self.priority_var = tk.StringVar(value="low")
-        priorities = [("🔴", "high"), ("🟡", "medium"), ("🟢", "low")]
-        
-        for symbol, level in priorities:
+        for symbol, level in [("🔴", "high"), ("🟡", "medium"), ("🟢", "low")]:
             rb = tk.Radiobutton(
                 add_frame, text=symbol, variable=self.priority_var,
-                value=level, bg=self.theme["bg"], font=("Segoe UI", 12),
+                value=level, bg=self.theme["bg"], font=("Segoe UI", 10),
                 indicatoron=False, bd=0, selectcolor=self.theme["highlight"]
             )
             rb.pack(side="left", padx=1)
@@ -599,57 +735,40 @@ class TodoWidget(BaseWidget):
         self.add_btn = tk.Button(
             add_frame, text="➕", command=self.add_task,
             bg=self.theme["accent"], fg="white",
-            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=5, cursor="hand2"
         )
         self.add_btn.pack(side="right")
         
         filter_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        filter_frame.pack(fill="x", pady=5)
+        filter_frame.pack(fill="x", pady=3)
         
         self.filter_var = tk.StringVar(value="all")
-        filters = [("All", "all"), ("Active", "active"), ("Done", "done")]
-        
-        for text, value in filters:
+        for text, value in [("All", "all"), ("Active", "active"), ("Done", "done")]:
             btn = tk.Radiobutton(
                 filter_frame, text=text, variable=self.filter_var,
                 value=value, bg=self.theme["button"], fg=self.theme["text"],
-                font=FONTS["small"], indicatoron=False, bd=0, padx=10, pady=3,
+                font=FONTS["tiny"], indicatoron=False, bd=0, padx=6, pady=2,
                 selectcolor=self.theme["accent"], command=self.load_tasks
             )
-            btn.pack(side="left", padx=2)
+            btn.pack(side="left", padx=1)
         
         self.clear_btn = tk.Button(
-            filter_frame, text="🗑️ Clear Done", command=self.clear_completed,
+            filter_frame, text="🗑️", command=self.clear_completed,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["small"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["small"], bd=0, padx=5, cursor="hand2"
         )
         self.clear_btn.pack(side="right")
         
-        list_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        list_frame.pack(fill="both", expand=True)
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=False, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
         
-        self.scrollbar = tk.Scrollbar(list_frame)
-        self.scrollbar.pack(side="right", fill="y")
-        
-        self.task_canvas = tk.Canvas(
-            list_frame, bg=self.theme["bg"], highlightthickness=0,
-            yscrollcommand=self.scrollbar.set
-        )
-        self.task_canvas.pack(side="left", fill="both", expand=True)
-        
-        self.scrollbar.config(command=self.task_canvas.yview)
-        
-        self.task_container = tk.Frame(self.task_canvas, bg=self.theme["bg"])
-        self.task_canvas.create_window((0, 0), window=self.task_container, anchor="nw")
-        
-        self.task_container.bind("<Configure>",
-            lambda e: self.task_canvas.configure(scrollregion=self.task_canvas.bbox("all")))
+        self.task_container = self.scroll_frame.inner_frame
         
         self.stats_label = tk.Label(
             self.content, text="", bg=self.theme["bg"],
-            fg=self.theme["text_light"], font=FONTS["small"]
+            fg=self.theme["text_light"], font=FONTS["tiny"]
         )
-        self.stats_label.pack(fill="x", pady=5)
+        self.stats_label.pack(fill="x", pady=2)
         
         self.load_tasks()
     
@@ -672,22 +791,20 @@ class TodoWidget(BaseWidget):
             if filter_type == "done" and not task.get("done"):
                 continue
             
-            self.create_task_row(i, task, tasks.index(task))
+            actual_idx = tasks.index(task)
+            self.create_task_row(task, actual_idx)
         
-        self.stats_label.config(text=f"📊 {done}/{total} completed")
+        self.stats_label.config(text=f"📊 {done}/{total} done")
     
-    def create_task_row(self, display_idx, task, actual_idx):
-        row = tk.Frame(self.task_container, bg=self.theme["entry"], pady=4)
-        row.pack(fill="x", pady=2, padx=2)
+    def create_task_row(self, task, actual_idx):
+        row = tk.Frame(self.task_container, bg=self.theme["entry"], pady=3)
+        row.pack(fill="x", pady=1, padx=1)
         
         priority_colors = {"high": "🔴", "medium": "🟡", "low": "🟢"}
         priority = task.get("priority", "low")
         
-        priority_lbl = tk.Label(
-            row, text=priority_colors.get(priority, "●"),
-            bg=self.theme["entry"], font=("Segoe UI", 10)
-        )
-        priority_lbl.pack(side="left", padx=3)
+        tk.Label(row, text=priority_colors.get(priority, "●"),
+                 bg=self.theme["entry"], font=("Segoe UI", 9)).pack(side="left", padx=2)
         
         var = tk.BooleanVar(value=task.get("done", False))
         cb = tk.Checkbutton(
@@ -699,35 +816,33 @@ class TodoWidget(BaseWidget):
         
         text = task.get("text", "")
         fg_color = self.theme["text_light"] if task.get("done") else self.theme["text"]
-        font_style = ("Segoe UI", 11, "overstrike") if task.get("done") else FONTS["normal"]
+        font_style = ("Segoe UI", 9, "overstrike") if task.get("done") else FONTS["small"]
         
         lbl = tk.Label(
             row, text=text, bg=self.theme["entry"],
-            fg=fg_color, font=font_style, anchor="w", wraplength=200
+            fg=fg_color, font=font_style, anchor="w"
         )
-        lbl.pack(side="left", fill="x", expand=True, padx=5)
+        lbl.pack(side="left", fill="x", expand=True, padx=3)
         
         del_btn = tk.Label(
             row, text="✕", bg=self.theme["entry"],
-            fg="#E74C3C", font=FONTS["small"], cursor="hand2"
+            fg="#E74C3C", font=FONTS["tiny"], cursor="hand2"
         )
-        del_btn.pack(side="right", padx=5)
-        del_btn.bind("<Button-1>", lambda e, idx=actual_idx: self.delete_task(idx))
+        del_btn.pack(side="right", padx=3)
+        del_btn.bind("<Button-1>", lambda e: self.delete_task(actual_idx))
     
     def add_task(self, event=None):
         text = self.task_entry.get().strip()
-        if text and text != "Add new task...":
+        if text and text != "New task...":
             if "todos" not in self.app.data:
                 self.app.data["todos"] = []
             
             self.app.data["todos"].append({
                 "text": text,
                 "done": False,
-                "priority": self.priority_var.get(),
-                "created": datetime.now().isoformat()
+                "priority": self.priority_var.get()
             })
             self.app.save_data()
-            
             self.task_entry.delete(0, "end")
             self.load_tasks()
     
@@ -755,76 +870,59 @@ class TodoWidget(BaseWidget):
         self.task_entry.config(bg=t["entry"], fg=t["text"])
         self.add_btn.config(bg=t["accent"])
         self.clear_btn.config(bg=t["button"], fg=t["text"])
-        self.task_canvas.config(bg=t["bg"])
-        self.task_container.config(bg=t["bg"])
+        self.scroll_frame.update_bg(t["bg"])
         self.stats_label.config(bg=t["bg"], fg=t["text_light"])
         self.load_tasks()
 
 
-# ============== DAY PLANNER WIDGET ==============
+# ============== DAY PLANNER ==============
 class DayPlannerWidget(BaseWidget):
     """Day Planner"""
     
     def __init__(self, master, app):
-        super().__init__(master, "📆 Day Planner", "day_planner", app, (320, 450))
+        super().__init__(master, "📆 Day Planner", "day_planner", app, (300, 400), (200, 200))
         self.current_date = datetime.now().strftime("%Y-%m-%d")
         self.create_content()
     
     def create_content(self):
         nav = tk.Frame(self.content, bg=self.theme["bg"])
-        nav.pack(fill="x", pady=5)
+        nav.pack(fill="x", pady=3)
         
         self.prev_btn = tk.Button(
             nav, text="◀", command=self.prev_day,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=6, cursor="hand2"
         )
         self.prev_btn.pack(side="left")
         
         self.date_label = tk.Label(
             nav, text="", bg=self.theme["bg"], fg=self.theme["text"],
-            font=FONTS["header"]
+            font=FONTS["small"]
         )
         self.date_label.pack(side="left", fill="x", expand=True)
-        
-        self.next_btn = tk.Button(
-            nav, text="▶", command=self.next_day,
-            bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
-        )
-        self.next_btn.pack(side="right")
         
         self.today_btn = tk.Button(
             nav, text="Today", command=self.go_today,
             bg=self.theme["accent"], fg="white",
-            font=FONTS["small"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["tiny"], bd=0, padx=5, cursor="hand2"
         )
-        self.today_btn.pack(side="right", padx=5)
+        self.today_btn.pack(side="right", padx=2)
         
-        scroll_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        scroll_frame.pack(fill="both", expand=True)
-        
-        self.scrollbar = tk.Scrollbar(scroll_frame)
-        self.scrollbar.pack(side="right", fill="y")
-        
-        self.canvas = tk.Canvas(
-            scroll_frame, bg=self.theme["bg"], highlightthickness=0,
-            yscrollcommand=self.scrollbar.set
+        self.next_btn = tk.Button(
+            nav, text="▶", command=self.next_day,
+            bg=self.theme["button"], fg=self.theme["text"],
+            font=FONTS["button"], bd=0, padx=6, cursor="hand2"
         )
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.next_btn.pack(side="right")
         
-        self.scrollbar.config(command=self.canvas.yview)
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=False, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
         
-        self.slots_frame = tk.Frame(self.canvas, bg=self.theme["bg"])
-        self.canvas.create_window((0, 0), window=self.slots_frame, anchor="nw")
-        
+        self.slots_frame = self.scroll_frame.inner_frame
         self.time_entries = {}
         
         for hour in range(5, 24):
             self.create_time_slot(hour)
-        
-        self.slots_frame.bind("<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         
         self.load_day_data()
     
@@ -833,46 +931,44 @@ class DayPlannerWidget(BaseWidget):
         row.pack(fill="x", pady=1)
         
         time_str = f"{hour:02d}:00"
-        bg_color = self.theme["accent"] if hour == datetime.now().hour and self.current_date == datetime.now().strftime("%Y-%m-%d") else self.theme["header"]
-        fg_color = "white" if hour == datetime.now().hour and self.current_date == datetime.now().strftime("%Y-%m-%d") else self.theme["text"]
         
         time_lbl = tk.Label(
-            row, text=time_str, bg=bg_color, fg=fg_color,
-            font=FONTS["small"], width=6
+            row, text=time_str, bg=self.theme["header"], fg=self.theme["text"],
+            font=FONTS["tiny"], width=5
         )
-        time_lbl.pack(side="left", padx=(0, 3))
+        time_lbl.pack(side="left", padx=(0, 2))
         
         entry = tk.Entry(
             row, bg=self.theme["entry"], fg=self.theme["text"],
-            font=FONTS["normal"], bd=1, relief="solid"
+            font=FONTS["small"], bd=1, relief="solid"
         )
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<KeyRelease>", lambda e, h=hour: self.save_slot(h))
         
-        self.time_entries[hour] = {"entry": entry, "label": time_lbl, "row": row}
+        self.time_entries[hour] = {"entry": entry, "label": time_lbl}
     
     def load_day_data(self):
         day_data = self.app.data.get("day_planner", {}).get(self.current_date, {})
         
         date_obj = datetime.strptime(self.current_date, "%Y-%m-%d")
-        day_name = date_obj.strftime("%A")
-        formatted_date = date_obj.strftime("%B %d, %Y")
-        self.date_label.config(text=f"{day_name}\n{formatted_date}")
+        self.date_label.config(text=f"{date_obj.strftime('%A, %b %d')}")
+        
+        current_hour = datetime.now().hour
+        is_today = self.current_date == datetime.now().strftime("%Y-%m-%d")
         
         for hour, widgets in self.time_entries.items():
             widgets["entry"].delete(0, "end")
             if str(hour) in day_data:
                 widgets["entry"].insert(0, day_data[str(hour)])
             
-            is_current = (hour == datetime.now().hour and self.current_date == datetime.now().strftime("%Y-%m-%d"))
-            bg_color = self.theme["accent"] if is_current else self.theme["header"]
-            fg_color = "white" if is_current else self.theme["text"]
-            widgets["label"].config(bg=bg_color, fg=fg_color)
+            is_current = (hour == current_hour and is_today)
+            bg = self.theme["accent"] if is_current else self.theme["header"]
+            fg = "white" if is_current else self.theme["text"]
+            widgets["label"].config(bg=bg, fg=fg)
     
     def save_slot(self, hour):
         if "day_planner" not in self.app.data:
             self.app.data["day_planner"] = {}
-        
         if self.current_date not in self.app.data["day_planner"]:
             self.app.data["day_planner"][self.current_date] = {}
         
@@ -905,17 +1001,16 @@ class DayPlannerWidget(BaseWidget):
         self.next_btn.config(bg=t["button"], fg=t["text"])
         self.today_btn.config(bg=t["accent"])
         self.date_label.config(bg=t["bg"], fg=t["text"])
-        self.canvas.config(bg=t["bg"])
-        self.slots_frame.config(bg=t["bg"])
+        self.scroll_frame.update_bg(t["bg"])
         self.load_day_data()
 
 
-# ============== HORIZONTAL WEEK PLANNER ==============
+# ============== WEEK PLANNER ==============
 class WeekPlannerWidget(BaseWidget):
     """Horizontal Week Planner"""
     
     def __init__(self, master, app):
-        super().__init__(master, "📋 Week Planner", "week_planner", app, (700, 350))
+        super().__init__(master, "📋 Week Planner", "week_planner", app, (600, 320), (300, 200))
         self.current_week_start = self.get_week_start(datetime.now())
         self.create_content()
     
@@ -924,71 +1019,74 @@ class WeekPlannerWidget(BaseWidget):
     
     def create_content(self):
         nav = tk.Frame(self.content, bg=self.theme["bg"])
-        nav.pack(fill="x", pady=5)
+        nav.pack(fill="x", pady=3)
         
         self.prev_btn = tk.Button(
-            nav, text="◀ Prev Week", command=self.prev_week,
+            nav, text="◀ Prev", command=self.prev_week,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=10, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
         )
         self.prev_btn.pack(side="left")
         
         self.week_label = tk.Label(
             nav, text="", bg=self.theme["bg"], fg=self.theme["text"],
-            font=FONTS["header"]
+            font=FONTS["small"]
         )
         self.week_label.pack(side="left", fill="x", expand=True)
-        
-        self.next_btn = tk.Button(
-            nav, text="Next Week ▶", command=self.next_week,
-            bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=10, cursor="hand2"
-        )
-        self.next_btn.pack(side="right")
         
         self.this_week_btn = tk.Button(
             nav, text="This Week", command=self.go_this_week,
             bg=self.theme["accent"], fg="white",
-            font=FONTS["small"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["tiny"], bd=0, padx=6, cursor="hand2"
         )
-        self.this_week_btn.pack(side="right", padx=5)
+        self.this_week_btn.pack(side="right", padx=3)
         
-        days_container = tk.Frame(self.content, bg=self.theme["bg"])
-        days_container.pack(fill="both", expand=True, pady=5)
+        self.next_btn = tk.Button(
+            nav, text="Next ▶", command=self.next_week,
+            bg=self.theme["button"], fg=self.theme["text"],
+            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
+        )
+        self.next_btn.pack(side="right")
+        
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=True, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
+        
+        self.days_frame = self.scroll_frame.inner_frame
         
         self.day_widgets = {}
         days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         
         for i, day in enumerate(days):
-            self.create_day_column(days_container, i, day)
+            self.create_day_column(i, day)
         
         self.load_week_data()
     
-    def create_day_column(self, parent, index, day_name):
-        col = tk.Frame(parent, bg=self.theme["entry"], bd=1, relief="solid")
-        col.pack(side="left", fill="both", expand=True, padx=2)
+    def create_day_column(self, index, day_name):
+        col = tk.Frame(self.days_frame, bg=self.theme["entry"], 
+                      relief="solid", bd=1, width=100)
+        col.pack(side="left", fill="y", padx=1)
+        col.pack_propagate(False)
         
         is_weekend = index >= 5
-        header_bg = self.theme["header"]
         header_fg = "#E74C3C" if is_weekend else self.theme["text"]
         
         header = tk.Label(
-            col, text=day_name[:3], bg=header_bg, fg=header_fg,
-            font=FONTS["header"], pady=5
+            col, text=day_name[:3], bg=self.theme["header"], fg=header_fg,
+            font=FONTS["small"], pady=3
         )
         header.pack(fill="x")
         
         date_lbl = tk.Label(
-            col, text="", bg=header_bg, fg=self.theme["text_light"],
-            font=FONTS["small"]
+            col, text="", bg=self.theme["header"], fg=self.theme["text_light"],
+            font=FONTS["tiny"]
         )
         date_lbl.pack(fill="x")
         
         text = tk.Text(
             col, bg=self.theme["entry"], fg=self.theme["text"],
-            font=FONTS["normal"], bd=0, wrap="word", width=12
+            font=FONTS["small"], bd=0, wrap="word", width=12, height=10
         )
-        text.pack(fill="both", expand=True, padx=5, pady=5)
+        text.pack(fill="both", expand=True, padx=3, pady=3)
         text.bind("<KeyRelease>", lambda e, idx=index: self.save_day(idx))
         
         self.day_widgets[index] = {"frame": col, "header": header, "date": date_lbl, "text": text}
@@ -999,7 +1097,7 @@ class WeekPlannerWidget(BaseWidget):
         
         week_end = self.current_week_start + timedelta(days=6)
         self.week_label.config(
-            text=f"{self.current_week_start.strftime('%B %d')} - {week_end.strftime('%B %d, %Y')}"
+            text=f"{self.current_week_start.strftime('%b %d')} - {week_end.strftime('%b %d, %Y')}"
         )
         
         today = datetime.now().date()
@@ -1013,10 +1111,7 @@ class WeekPlannerWidget(BaseWidget):
                 widgets["date"].config(bg=self.theme["accent"], fg="white")
             else:
                 is_weekend = i >= 5
-                widgets["header"].config(
-                    bg=self.theme["header"],
-                    fg="#E74C3C" if is_weekend else self.theme["text"]
-                )
+                widgets["header"].config(bg=self.theme["header"], fg="#E74C3C" if is_weekend else self.theme["text"])
                 widgets["date"].config(bg=self.theme["header"], fg=self.theme["text_light"])
             
             widgets["text"].delete("1.0", "end")
@@ -1028,7 +1123,6 @@ class WeekPlannerWidget(BaseWidget):
             self.app.data["week_planner"] = {}
         
         week_key = self.current_week_start.strftime("%Y-%m-%d")
-        
         if week_key not in self.app.data["week_planner"]:
             self.app.data["week_planner"][week_key] = {}
         
@@ -1059,6 +1153,7 @@ class WeekPlannerWidget(BaseWidget):
         self.next_btn.config(bg=t["button"], fg=t["text"])
         self.this_week_btn.config(bg=t["accent"])
         self.week_label.config(bg=t["bg"], fg=t["text"])
+        self.scroll_frame.update_bg(t["bg"])
         self.load_week_data()
 
 
@@ -1067,18 +1162,18 @@ class MonthlyPlannerWidget(BaseWidget):
     """Monthly Planner"""
     
     def __init__(self, master, app):
-        super().__init__(master, "🎯 Monthly Planner", "monthly_planner", app, (350, 450))
+        super().__init__(master, "🎯 Monthly Planner", "monthly_planner", app, (320, 400), (200, 200))
         self.current_date = datetime.now()
         self.create_content()
     
     def create_content(self):
         nav = tk.Frame(self.content, bg=self.theme["bg"])
-        nav.pack(fill="x", pady=5)
+        nav.pack(fill="x", pady=3)
         
         self.prev_btn = tk.Button(
             nav, text="◀", command=self.prev_month,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=6, cursor="hand2"
         )
         self.prev_btn.pack(side="left")
         
@@ -1091,58 +1186,42 @@ class MonthlyPlannerWidget(BaseWidget):
         self.next_btn = tk.Button(
             nav, text="▶", command=self.next_month,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=8, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=6, cursor="hand2"
         )
         self.next_btn.pack(side="right")
         
-        scroll_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        scroll_frame.pack(fill="both", expand=True)
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=False, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
         
-        self.scrollbar = tk.Scrollbar(scroll_frame)
-        self.scrollbar.pack(side="right", fill="y")
-        
-        self.canvas = tk.Canvas(
-            scroll_frame, bg=self.theme["bg"], highlightthickness=0,
-            yscrollcommand=self.scrollbar.set
-        )
-        self.canvas.pack(side="left", fill="both", expand=True)
-        
-        self.scrollbar.config(command=self.canvas.yview)
-        
-        self.sections_frame = tk.Frame(self.canvas, bg=self.theme["bg"])
-        self.canvas.create_window((0, 0), window=self.sections_frame, anchor="nw")
-        
+        self.sections_frame = self.scroll_frame.inner_frame
         self.section_widgets = {}
         
         sections = [
-            ("🎯 Monthly Goals", "goals", "#4CAF50"),
-            ("📝 Key Tasks", "tasks", "#2196F3"),
-            ("💡 Ideas & Projects", "ideas", "#FF9800"),
-            ("📊 Review & Reflection", "review", "#9C27B0"),
+            ("🎯 Goals", "goals", "#4CAF50"),
+            ("📝 Tasks", "tasks", "#2196F3"),
+            ("💡 Ideas", "ideas", "#FF9800"),
+            ("📊 Review", "review", "#9C27B0"),
             ("✨ Notes", "notes", "#607D8B")
         ]
         
         for title, key, color in sections:
             self.create_section(title, key, color)
         
-        self.sections_frame.bind("<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        
         self.load_month_data()
     
     def create_section(self, title, key, color):
-        frame = tk.Frame(self.sections_frame, bg=self.theme["entry"], bd=1, relief="solid")
-        frame.pack(fill="x", pady=4, padx=2)
+        frame = tk.Frame(self.sections_frame, bg=self.theme["entry"], relief="solid", bd=1)
+        frame.pack(fill="x", pady=2)
         
         header = tk.Label(
             frame, text=title, bg=color, fg="white",
-            font=FONTS["header"], anchor="w", padx=10, pady=5
+            font=FONTS["small"], anchor="w", padx=8, pady=3
         )
         header.pack(fill="x")
         
         text = tk.Text(
-            frame, height=4, bg=self.theme["entry"], fg=self.theme["text"],
-            font=FONTS["normal"], bd=0, wrap="word", padx=8, pady=5
+            frame, height=3, bg=self.theme["entry"], fg=self.theme["text"],
+            font=FONTS["small"], bd=0, wrap="word", padx=5, pady=3
         )
         text.pack(fill="x")
         text.bind("<KeyRelease>", lambda e, k=key: self.save_section(k))
@@ -1167,7 +1246,6 @@ class MonthlyPlannerWidget(BaseWidget):
             self.app.data["monthly_planner"] = {}
         
         month_key = self.current_date.strftime("%Y-%m")
-        
         if month_key not in self.app.data["monthly_planner"]:
             self.app.data["monthly_planner"][month_key] = {}
         
@@ -1199,8 +1277,7 @@ class MonthlyPlannerWidget(BaseWidget):
         self.prev_btn.config(bg=t["button"], fg=t["text"])
         self.next_btn.config(bg=t["button"], fg=t["text"])
         self.month_label.config(bg=t["bg"], fg=t["text"])
-        self.canvas.config(bg=t["bg"])
-        self.sections_frame.config(bg=t["bg"])
+        self.scroll_frame.update_bg(t["bg"])
         for key, widgets in self.section_widgets.items():
             widgets["frame"].config(bg=t["entry"])
             widgets["text"].config(bg=t["entry"], fg=t["text"])
@@ -1211,28 +1288,28 @@ class StickyNotesWidget(BaseWidget):
     """Sticky Notes"""
     
     def __init__(self, master, app):
-        super().__init__(master, "📝 Sticky Notes", "sticky_notes", app, (350, 400))
+        super().__init__(master, "📝 Sticky Notes", "sticky_notes", app, (320, 350), (200, 200))
         self.note_colors = ["#FFFFA5", "#A5FFFA", "#FFA5FF", "#A5FFA5", "#FFA5A5", "#A5A5FF"]
         self.create_content()
     
     def create_content(self):
         add_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        add_frame.pack(fill="x", pady=5)
+        add_frame.pack(fill="x", pady=3)
         
-        tk.Label(
-            add_frame, text="Add note:", bg=self.theme["bg"],
-            fg=self.theme["text"], font=FONTS["small"]
-        ).pack(side="left", padx=5)
+        tk.Label(add_frame, text="Add:", bg=self.theme["bg"], fg=self.theme["text"], 
+                font=FONTS["tiny"]).pack(side="left", padx=3)
         
         for color in self.note_colors:
             btn = tk.Button(
-                add_frame, text="  ", bg=color, bd=1, relief="solid",
+                add_frame, text=" ", bg=color, bd=1, relief="solid", width=2,
                 command=lambda c=color: self.add_note(c), cursor="hand2"
             )
-            btn.pack(side="left", padx=2)
+            btn.pack(side="left", padx=1)
         
-        self.notes_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        self.notes_frame.pack(fill="both", expand=True, pady=5)
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=False, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
+        
+        self.notes_frame = self.scroll_frame.inner_frame
         
         self.load_notes()
     
@@ -1254,21 +1331,16 @@ class StickyNotesWidget(BaseWidget):
     def create_note_card(self, index, note, row, col):
         color = note.get("color", "#FFFFA5")
         
-        frame = tk.Frame(self.notes_frame, bg=color, bd=1, relief="solid")
-        frame.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+        frame = tk.Frame(self.notes_frame, bg=color, relief="solid", bd=1, width=120, height=80)
+        frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+        frame.grid_propagate(False)
         
-        del_btn = tk.Label(
-            frame, text="✕", bg=color, fg="#666666",
-            font=FONTS["tiny"], cursor="hand2"
-        )
-        del_btn.pack(anchor="ne", padx=2, pady=1)
-        del_btn.bind("<Button-1>", lambda e, idx=index: self.delete_note(idx))
+        del_btn = tk.Label(frame, text="✕", bg=color, fg="#666666", font=FONTS["tiny"], cursor="hand2")
+        del_btn.pack(anchor="ne", padx=1)
+        del_btn.bind("<Button-1>", lambda e: self.delete_note(index))
         
-        text = tk.Text(
-            frame, height=5, width=18, bg=color, fg="#333333",
-            font=FONTS["normal"], bd=0, wrap="word"
-        )
-        text.pack(fill="both", expand=True, padx=5, pady=2)
+        text = tk.Text(frame, height=3, width=14, bg=color, fg="#333333", font=FONTS["tiny"], bd=0, wrap="word")
+        text.pack(fill="both", expand=True, padx=3, pady=1)
         text.insert("1.0", note.get("text", ""))
         text.bind("<KeyRelease>", lambda e, idx=index, t=text: self.save_note(idx, t))
         
@@ -1278,7 +1350,6 @@ class StickyNotesWidget(BaseWidget):
     def add_note(self, color):
         if "sticky_notes" not in self.app.data:
             self.app.data["sticky_notes"] = []
-        
         self.app.data["sticky_notes"].append({"text": "", "color": color})
         self.app.save_data()
         self.load_notes()
@@ -1296,19 +1367,18 @@ class StickyNotesWidget(BaseWidget):
     
     def update_theme(self):
         super().update_theme()
-        self.notes_frame.config(bg=self.theme["bg"])
+        self.scroll_frame.update_bg(self.theme["bg"])
         self.load_notes()
 
 
-# ============== POMODORO TIMER ==============
+# ============== POMODORO ==============
 class PomodoroWidget(BaseWidget):
     """Pomodoro Timer"""
     
     def __init__(self, master, app):
-        super().__init__(master, "🍅 Pomodoro Timer", "pomodoro", app, (280, 320))
+        super().__init__(master, "🍅 Pomodoro", "pomodoro", app, (250, 280), (180, 200))
         self.work_time = 25 * 60
         self.break_time = 5 * 60
-        self.long_break = 15 * 60
         self.current_time = self.work_time
         self.is_running = False
         self.is_work = True
@@ -1318,67 +1388,66 @@ class PomodoroWidget(BaseWidget):
     def create_content(self):
         self.timer_label = tk.Label(
             self.content, text="25:00", bg=self.theme["bg"],
-            fg=self.theme["accent"], font=("Segoe UI Light", 48)
+            fg=self.theme["accent"], font=("Segoe UI Light", 40)
         )
-        self.timer_label.pack(pady=20)
+        self.timer_label.pack(pady=10)
         
         self.status_label = tk.Label(
-            self.content, text="🍅 Work Time", bg=self.theme["bg"],
-            fg=self.theme["text"], font=FONTS["header"]
+            self.content, text="🍅 Work", bg=self.theme["bg"],
+            fg=self.theme["text"], font=FONTS["normal"]
         )
         self.status_label.pack()
         
         self.sessions_label = tk.Label(
             self.content, text="Sessions: 0", bg=self.theme["bg"],
-            fg=self.theme["text_light"], font=FONTS["small"]
+            fg=self.theme["text_light"], font=FONTS["tiny"]
         )
-        self.sessions_label.pack(pady=5)
+        self.sessions_label.pack(pady=3)
         
         controls = tk.Frame(self.content, bg=self.theme["bg"])
-        controls.pack(pady=15)
+        controls.pack(pady=10)
         
         self.start_btn = tk.Button(
-            controls, text="▶ Start", command=self.toggle_timer,
+            controls, text="▶", command=self.toggle_timer,
             bg=self.theme["accent"], fg="white",
-            font=FONTS["button"], bd=0, padx=20, pady=8, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=15, pady=5, cursor="hand2"
         )
-        self.start_btn.pack(side="left", padx=5)
+        self.start_btn.pack(side="left", padx=3)
         
         self.reset_btn = tk.Button(
-            controls, text="↺ Reset", command=self.reset_timer,
+            controls, text="↺", command=self.reset_timer,
             bg=self.theme["button"], fg=self.theme["text"],
-            font=FONTS["button"], bd=0, padx=20, pady=8, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=15, pady=5, cursor="hand2"
         )
-        self.reset_btn.pack(side="left", padx=5)
+        self.reset_btn.pack(side="left", padx=3)
         
         settings = tk.Frame(self.content, bg=self.theme["bg"])
-        settings.pack(pady=10)
+        settings.pack(pady=5)
         
-        tk.Label(settings, text="Work:", bg=self.theme["bg"], fg=self.theme["text"], font=FONTS["small"]).pack(side="left")
-        self.work_spin = tk.Spinbox(settings, from_=1, to=60, width=3, font=FONTS["small"])
-        self.work_spin.pack(side="left", padx=2)
+        tk.Label(settings, text="Work:", bg=self.theme["bg"], fg=self.theme["text"], font=FONTS["tiny"]).pack(side="left")
+        self.work_spin = tk.Spinbox(settings, from_=1, to=60, width=3, font=FONTS["tiny"])
+        self.work_spin.pack(side="left", padx=1)
         self.work_spin.delete(0, "end")
         self.work_spin.insert(0, "25")
         
-        tk.Label(settings, text="  Break:", bg=self.theme["bg"], fg=self.theme["text"], font=FONTS["small"]).pack(side="left")
-        self.break_spin = tk.Spinbox(settings, from_=1, to=30, width=3, font=FONTS["small"])
-        self.break_spin.pack(side="left", padx=2)
+        tk.Label(settings, text=" Break:", bg=self.theme["bg"], fg=self.theme["text"], font=FONTS["tiny"]).pack(side="left")
+        self.break_spin = tk.Spinbox(settings, from_=1, to=30, width=3, font=FONTS["tiny"])
+        self.break_spin.pack(side="left", padx=1)
         self.break_spin.delete(0, "end")
         self.break_spin.insert(0, "5")
     
     def toggle_timer(self):
         if self.is_running:
             self.is_running = False
-            self.start_btn.config(text="▶ Start", bg=self.theme["accent"])
+            self.start_btn.config(text="▶", bg=self.theme["accent"])
         else:
             try:
                 self.work_time = int(self.work_spin.get()) * 60
                 self.break_time = int(self.break_spin.get()) * 60
             except:
                 pass
-            
             self.is_running = True
-            self.start_btn.config(text="⏸ Pause", bg="#FF9800")
+            self.start_btn.config(text="⏸", bg="#FF9800")
             self.run_timer()
     
     def run_timer(self):
@@ -1387,24 +1456,19 @@ class PomodoroWidget(BaseWidget):
             self.timer_label.config(text=f"{mins:02d}:{secs:02d}")
             self.current_time -= 1
             self.window.after(1000, self.run_timer)
-        elif self.is_running and self.current_time <= 0:
+        elif self.is_running:
             self.timer_complete()
     
     def timer_complete(self):
         if self.is_work:
             self.sessions += 1
             self.sessions_label.config(text=f"Sessions: {self.sessions}")
-            
-            if self.sessions % 4 == 0:
-                self.current_time = self.long_break
-                self.status_label.config(text="☕ Long Break!")
-            else:
-                self.current_time = self.break_time
-                self.status_label.config(text="☕ Break Time!")
+            self.current_time = self.break_time
+            self.status_label.config(text="☕ Break")
             self.is_work = False
         else:
             self.current_time = self.work_time
-            self.status_label.config(text="🍅 Work Time")
+            self.status_label.config(text="🍅 Work")
             self.is_work = True
         
         try:
@@ -1425,8 +1489,8 @@ class PomodoroWidget(BaseWidget):
         self.current_time = self.work_time
         mins, secs = divmod(self.current_time, 60)
         self.timer_label.config(text=f"{mins:02d}:{secs:02d}")
-        self.status_label.config(text="🍅 Work Time")
-        self.start_btn.config(text="▶ Start", bg=self.theme["accent"])
+        self.status_label.config(text="🍅 Work")
+        self.start_btn.config(text="▶", bg=self.theme["accent"])
     
     def update_theme(self):
         super().update_theme()
@@ -1434,7 +1498,6 @@ class PomodoroWidget(BaseWidget):
         self.timer_label.config(bg=t["bg"], fg=t["accent"])
         self.status_label.config(bg=t["bg"], fg=t["text"])
         self.sessions_label.config(bg=t["bg"], fg=t["text_light"])
-        self.start_btn.config(bg=t["accent"] if not self.is_running else "#FF9800")
         self.reset_btn.config(bg=t["button"], fg=t["text"])
 
 
@@ -1443,42 +1506,31 @@ class HabitTrackerWidget(BaseWidget):
     """Habit Tracker"""
     
     def __init__(self, master, app):
-        super().__init__(master, "📊 Habit Tracker", "habit_tracker", app, (400, 380))
+        super().__init__(master, "📊 Habits", "habit_tracker", app, (350, 320), (250, 180))
         self.create_content()
     
     def create_content(self):
         add_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        add_frame.pack(fill="x", pady=5)
+        add_frame.pack(fill="x", pady=3)
         
         self.habit_entry = tk.Entry(
             add_frame, bg=self.theme["entry"], fg=self.theme["text"],
-            font=FONTS["normal"], bd=1, relief="solid"
+            font=FONTS["small"], bd=1, relief="solid"
         )
-        self.habit_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.habit_entry.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.habit_entry.bind("<Return>", self.add_habit)
         
         self.add_btn = tk.Button(
-            add_frame, text="➕ Add Habit", command=self.add_habit,
+            add_frame, text="➕", command=self.add_habit,
             bg=self.theme["accent"], fg="white",
-            font=FONTS["button"], bd=0, padx=10, cursor="hand2"
+            font=FONTS["button"], bd=0, padx=6, cursor="hand2"
         )
         self.add_btn.pack(side="right")
         
-        week_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        week_frame.pack(fill="x", pady=5)
+        self.scroll_frame = ScrollableFrame(self.content, bg=self.theme["bg"], scroll_x=True, scroll_y=True)
+        self.scroll_frame.pack(fill="both", expand=True)
         
-        tk.Label(week_frame, text="Habit", bg=self.theme["bg"], fg=self.theme["text"], 
-                 font=FONTS["small"], width=15, anchor="w").pack(side="left", padx=5)
-        
-        days = ["M", "T", "W", "T", "F", "S", "S"]
-        for day in days:
-            tk.Label(week_frame, text=day, bg=self.theme["header"], fg=self.theme["text"],
-                     font=FONTS["small"], width=3).pack(side="left", padx=2)
-        
-        tk.Label(week_frame, text="", width=3, bg=self.theme["bg"]).pack(side="left")
-        
-        self.habits_frame = tk.Frame(self.content, bg=self.theme["bg"])
-        self.habits_frame.pack(fill="both", expand=True)
+        self.habits_frame = self.scroll_frame.inner_frame
         
         self.load_habits()
     
@@ -1494,18 +1546,25 @@ class HabitTrackerWidget(BaseWidget):
         habits = self.app.data.get("habits", [])
         week_key = self.get_week_key()
         
+        tk.Label(self.habits_frame, text="Habit", bg=self.theme["bg"], fg=self.theme["text"],
+                font=FONTS["small"], width=12, anchor="w").grid(row=0, column=0, padx=2, pady=2)
+        
+        days = ["M", "T", "W", "T", "F", "S", "S"]
+        for col, day in enumerate(days):
+            tk.Label(self.habits_frame, text=day, bg=self.theme["header"], fg=self.theme["text"],
+                    font=FONTS["tiny"], width=3).grid(row=0, column=col+1, padx=1, pady=2)
+        
+        tk.Label(self.habits_frame, text="", width=2, bg=self.theme["bg"]).grid(row=0, column=8)
+        
         for i, habit in enumerate(habits):
             self.create_habit_row(i, habit, week_key)
     
     def create_habit_row(self, index, habit, week_key):
-        row = tk.Frame(self.habits_frame, bg=self.theme["entry"], pady=3)
-        row.pack(fill="x", pady=2, padx=2)
+        row_num = index + 1
         
-        name_lbl = tk.Label(
-            row, text=habit["name"][:15], bg=self.theme["entry"],
-            fg=self.theme["text"], font=FONTS["small"], width=15, anchor="w"
-        )
-        name_lbl.pack(side="left", padx=5)
+        tk.Label(self.habits_frame, text=habit["name"][:12], bg=self.theme["entry"],
+                fg=self.theme["text"], font=FONTS["tiny"], width=12, anchor="w"
+                ).grid(row=row_num, column=0, padx=2, pady=1, sticky="w")
         
         checked = habit.get("checked", {}).get(week_key, [False] * 7)
         while len(checked) < 7:
@@ -1514,28 +1573,24 @@ class HabitTrackerWidget(BaseWidget):
         for day in range(7):
             var = tk.BooleanVar(value=checked[day])
             cb = tk.Checkbutton(
-                row, variable=var, bg=self.theme["entry"],
+                self.habits_frame, variable=var, bg=self.theme["entry"],
                 activebackground=self.theme["entry"],
                 command=lambda idx=index, d=day, v=var: self.toggle_day(idx, d, v.get())
             )
-            cb.pack(side="left", padx=2)
+            cb.grid(row=row_num, column=day+1, padx=1, pady=1)
         
-        del_btn = tk.Label(
-            row, text="✕", bg=self.theme["entry"],
-            fg="#E74C3C", font=FONTS["tiny"], cursor="hand2"
-        )
-        del_btn.pack(side="right", padx=5)
-        del_btn.bind("<Button-1>", lambda e, idx=index: self.delete_habit(idx))
+        del_btn = tk.Label(self.habits_frame, text="✕", bg=self.theme["bg"],
+                          fg="#E74C3C", font=FONTS["tiny"], cursor="hand2")
+        del_btn.grid(row=row_num, column=8, padx=2)
+        del_btn.bind("<Button-1>", lambda e: self.delete_habit(index))
     
     def add_habit(self, event=None):
         name = self.habit_entry.get().strip()
         if name:
             if "habits" not in self.app.data:
                 self.app.data["habits"] = []
-            
             self.app.data["habits"].append({"name": name, "checked": {}})
             self.app.save_data()
-            
             self.habit_entry.delete(0, "end")
             self.load_habits()
     
@@ -1543,13 +1598,10 @@ class HabitTrackerWidget(BaseWidget):
         if "habits" in self.app.data and habit_index < len(self.app.data["habits"]):
             week_key = self.get_week_key()
             habit = self.app.data["habits"][habit_index]
-            
             if "checked" not in habit:
                 habit["checked"] = {}
-            
             if week_key not in habit["checked"]:
                 habit["checked"][week_key] = [False] * 7
-            
             habit["checked"][week_key][day] = checked
             self.app.save_data()
     
@@ -1564,16 +1616,16 @@ class HabitTrackerWidget(BaseWidget):
         t = self.theme
         self.habit_entry.config(bg=t["entry"], fg=t["text"])
         self.add_btn.config(bg=t["accent"])
-        self.habits_frame.config(bg=t["bg"])
+        self.scroll_frame.update_bg(t["bg"])
         self.load_habits()
 
 
-# ============== CLOCK WIDGET ==============
+# ============== CLOCK ==============
 class ClockWidget(BaseWidget):
     """Digital Clock"""
     
     def __init__(self, master, app):
-        super().__init__(master, "🕐 Clock", "clock", app, (250, 180))
+        super().__init__(master, "🕐 Clock", "clock", app, (220, 150), (150, 100))
         self.create_content()
         self.update_clock()
     
@@ -1586,14 +1638,14 @@ class ClockWidget(BaseWidget):
         
         self.date_label = tk.Label(
             self.content, text="", bg=self.theme["bg"],
-            fg=self.theme["text"], font=FONTS["clock_date"]
+            fg=self.theme["text"], font=FONTS["small"]
         )
-        self.date_label.pack(pady=(0, 10))
+        self.date_label.pack(pady=(0, 5))
     
     def update_clock(self):
         now = datetime.now()
         self.time_label.config(text=now.strftime("%H:%M:%S"))
-        self.date_label.config(text=now.strftime("%A, %B %d, %Y"))
+        self.date_label.config(text=now.strftime("%a, %b %d"))
         self.window.after(1000, self.update_clock)
     
     def update_theme(self):
@@ -1638,8 +1690,7 @@ class DesktopWidgetsApp:
             "habits": [],
             "widget_positions": {},
             "widget_sizes": {},
-            "hidden_widgets": [],
-            "autostart": True
+            "hidden_widgets": []
         }
     
     def save_data(self):
@@ -1671,65 +1722,67 @@ class DesktopWidgetsApp:
     
     def create_control_panel(self):
         self.control = tk.Toplevel(self.root)
-        self.control.title("🎮 Widget Control Panel")
-        self.control.geometry("320x620")
+        self.control.title("🎮 Control Panel")
+        self.control.geometry("280x520")
         self.control.resizable(False, False)
         self.control.attributes('-topmost', True)
         
         theme = THEMES.get(self.data.get("theme", "🌊 Ocean Blue"), THEMES["🌊 Ocean Blue"])
         self.control.configure(bg=theme["bg"])
         
-        # Title
-        title = tk.Label(
-            self.control, text="🖥️ Desktop Widgets Pro",
+        tk.Label(
+            self.control, text="🖥️ Desktop Widgets",
             bg=theme["header"], fg=theme["text"],
-            font=("Segoe UI Semibold", 14), pady=12
-        )
-        title.pack(fill="x")
+            font=("Segoe UI Semibold", 13), pady=10
+        ).pack(fill="x")
         
-        # Autostart section
-        autostart_frame = tk.LabelFrame(
-            self.control, text="⚡ Startup Settings",
-            bg=theme["bg"], fg=theme["text"], font=FONTS["header"]
+        # Info about desktop integration
+        tk.Label(
+            self.control,
+            text="✨ Widgets stay on desktop!\n(Won't hide on 3-finger swipe)",
+            bg=theme["highlight"], fg=theme["text"],
+            font=FONTS["tiny"], pady=5
+        ).pack(fill="x", padx=8, pady=5)
+        
+        # Autostart
+        auto_frame = tk.LabelFrame(
+            self.control, text="⚡ Startup",
+            bg=theme["bg"], fg=theme["text"], font=FONTS["small"]
         )
-        autostart_frame.pack(fill="x", padx=10, pady=8)
+        auto_frame.pack(fill="x", padx=8, pady=5)
         
         self.autostart_var = tk.BooleanVar(value=is_autostart_enabled())
         
-        self.autostart_cb = tk.Checkbutton(
-            autostart_frame, 
-            text="🚀 Start with Windows",
-            variable=self.autostart_var,
-            bg=theme["bg"], fg=theme["text"], font=FONTS["normal"],
-            activebackground=theme["bg"], selectcolor=theme["entry"],
-            command=self.toggle_autostart
-        )
-        self.autostart_cb.pack(anchor="w", padx=10, pady=5)
+        tk.Checkbutton(
+            auto_frame, text="🚀 Start with Windows",
+            variable=self.autostart_var, bg=theme["bg"], fg=theme["text"],
+            font=FONTS["small"], activebackground=theme["bg"],
+            selectcolor=theme["entry"], command=self.toggle_autostart
+        ).pack(anchor="w", padx=8, pady=3)
         
         self.autostart_status = tk.Label(
-            autostart_frame, text="", bg=theme["bg"],
-            fg=theme["text_light"], font=FONTS["small"]
+            auto_frame, text="", bg=theme["bg"], font=FONTS["tiny"]
         )
-        self.autostart_status.pack(anchor="w", padx=10)
+        self.autostart_status.pack(anchor="w", padx=8)
         self.update_autostart_status()
         
-        # Widgets section
+        # Widgets
         widgets_frame = tk.LabelFrame(
-            self.control, text="📦 Show/Hide Widgets",
-            bg=theme["bg"], fg=theme["text"], font=FONTS["header"]
+            self.control, text="📦 Widgets",
+            bg=theme["bg"], fg=theme["text"], font=FONTS["small"]
         )
-        widgets_frame.pack(fill="x", padx=10, pady=8)
+        widgets_frame.pack(fill="x", padx=8, pady=5)
         
         widget_names = {
             "calendar": "📅 Calendar",
-            "todo": "✅ To-Do List",
+            "todo": "✅ To-Do",
             "day_planner": "📆 Day Planner",
             "week_planner": "📋 Week Planner",
-            "monthly_planner": "🎯 Monthly Planner",
+            "monthly_planner": "🎯 Monthly",
             "sticky_notes": "📝 Sticky Notes",
-            "pomodoro": "🍅 Pomodoro Timer",
-            "habit_tracker": "📊 Habit Tracker",
-            "clock": "🕐 Digital Clock"
+            "pomodoro": "🍅 Pomodoro",
+            "habit_tracker": "📊 Habits",
+            "clock": "🕐 Clock"
         }
         
         self.widget_vars = {}
@@ -1739,68 +1792,50 @@ class DesktopWidgetsApp:
             var = tk.BooleanVar(value=widget_id not in hidden)
             self.widget_vars[widget_id] = var
             
-            cb = tk.Checkbutton(
+            tk.Checkbutton(
                 widgets_frame, text=widget_name, variable=var,
-                bg=theme["bg"], fg=theme["text"], font=FONTS["normal"],
+                bg=theme["bg"], fg=theme["text"], font=FONTS["small"],
                 activebackground=theme["bg"], selectcolor=theme["entry"],
                 command=lambda wid=widget_id: self.toggle_widget(wid)
-            )
-            cb.pack(anchor="w", padx=10, pady=1)
+            ).pack(anchor="w", padx=8, pady=1)
         
-        # Quick buttons
+        # Buttons
         btn_frame = tk.Frame(self.control, bg=theme["bg"])
-        btn_frame.pack(fill="x", padx=10, pady=5)
+        btn_frame.pack(fill="x", padx=8, pady=5)
         
         tk.Button(
             btn_frame, text="👁️ Show All", command=self.show_all,
             bg=theme["button"], fg=theme["text"], font=FONTS["button"],
-            bd=0, padx=15, cursor="hand2"
-        ).pack(side="left", padx=5)
+            bd=0, padx=10, cursor="hand2"
+        ).pack(side="left", padx=3)
         
         tk.Button(
             btn_frame, text="🙈 Hide All", command=self.hide_all,
             bg=theme["button"], fg=theme["text"], font=FONTS["button"],
-            bd=0, padx=15, cursor="hand2"
-        ).pack(side="left", padx=5)
+            bd=0, padx=10, cursor="hand2"
+        ).pack(side="left", padx=3)
         
-        # Info
-        info = tk.Label(
-            self.control,
-            text="💡 Click 🎨 on any widget to change its color!\n\n📁 App location:\n" + APP_PATH[:50] + "...",
-            bg=theme["bg"], fg=theme["text_light"],
-            font=FONTS["tiny"], justify="center", wraplength=280
-        )
-        info.pack(pady=5)
-        
-        # Exit button
+        # Exit
         tk.Button(
-            self.control, text="❌ Exit Application", command=self.exit_app,
+            self.control, text="❌ Exit", command=self.exit_app,
             bg="#E74C3C", fg="white", font=FONTS["button"],
-            bd=0, padx=20, pady=8, cursor="hand2"
-        ).pack(pady=10)
+            bd=0, padx=15, pady=5, cursor="hand2"
+        ).pack(pady=8)
         
         self.control.protocol("WM_DELETE_WINDOW", self.minimize_control)
     
     def toggle_autostart(self):
-        """Toggle autostart on/off"""
         if self.autostart_var.get():
-            success = enable_autostart()
-            if success:
-                self.data["autostart"] = True
-                self.save_data()
+            enable_autostart()
         else:
             disable_autostart()
-            self.data["autostart"] = False
-            self.save_data()
-        
         self.update_autostart_status()
     
     def update_autostart_status(self):
-        """Update autostart status label"""
         if is_autostart_enabled():
-            self.autostart_status.config(text="✅ Will start automatically with Windows", fg="#27AE60")
+            self.autostart_status.config(text="✅ Enabled", fg="#27AE60")
         else:
-            self.autostart_status.config(text="❌ Will NOT start with Windows", fg="#E74C3C")
+            self.autostart_status.config(text="❌ Disabled", fg="#E74C3C")
     
     def update_control_panel(self):
         hidden = self.data.get("hidden_widgets", [])
